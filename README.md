@@ -2,7 +2,7 @@
 
 Orca is an [esoteric programming language](https://en.wikipedia.org/wiki/Esoteric_programming_language) and live editor designed to quickly create procedural sequencers. Every letter of the alphabet is an operation, lowercase letters execute on `*bang*`, and uppercase letters execute each frame.
 
-This is the C implementation of the [ORCΛ](https://wiki.xxiivv.com/site/orca.html) language and terminal livecoding environment. It's designed to be power efficient. It can handle large files, even if your terminal is small.
+This is the C implementation of the [ORCΛ](https://wiki.xxiivv.com/site/orca.html) language and terminal livecoding environment. It's designed to be power efficient. It can handle large files, even if your terminal is small. This version also includes a terminal file browser and non-destructive module import with placement preview.
 
 Orca is not a synthesizer, but a flexible livecoding environment capable of sending MIDI, OSC, and UDP to your audio/visual interfaces like Ableton, Renoise, VCV Rack, or SuperCollider.
 
@@ -28,6 +28,7 @@ To choose your MIDI output device, press `F1` (or `Ctrl+D`) to open the main men
 ┌ ORCA ───────────────┐┌ PortMidi Device Selection ─────┐
 │   New               ││ > (*) #0 - Midi Through Port-0 │
 │   Open...           ││   ( ) #2 - ES1371              │
+│   Import as module...│
 │   Save              │└────────────────────────────────┘
 │   Save As...        │
 │                     │
@@ -131,12 +132,23 @@ $ ./tool build --portmidi orca           # compile orca using build script
 $ build/orca                             # run orca
 ```
 
+### File browsing and module import
+
+Open the main menu with `F1` or `Ctrl+D`, then choose `Open...` to browse from the current working directory. Use the arrow keys to select files and folders, `Enter` to open a folder or file, and `.. (parent folder)` to go up one level. Large folders are shown eight entries per page. `Ctrl+O` opens the same browser directly.
+
+`Save` overwrites the current file. For a new, unnamed project, the first `Save` opens `Save As`. `Save As...` defaults to the directory containing the running executable, regardless of the shell's current directory. The form shows the filename; its title identifies the destination directory.
+
+Choose `Import as module...` to select a grid and preview it at the current cursor position. Move the preview with the arrow keys, then press `Enter` to place it or `Escape` to cancel. The import trims empty outer margins while preserving empty cells inside the module. Those internal `.` cells are transparent. Existing project cells are preserved; if any module content would overlap an occupied cell, the import is rejected and the preview stays active so it can be repositioned. The grid expands when needed, and the import can be undone in one step. Importing does not change the current project filename.
+
 ### `orca` Livecoding Environment Controls
 
 ```
 ┌ Controls ───────────────────────────────────────────┐
 │           Ctrl+Q  Quit                              │
 │       Arrow Keys  Move Cursor                       │
+│ Ctrl+H/J/K/L or  Move by ruler spacing              │
+│   Ctrl+Arrow Keys                                   │
+│ Enter / Escape   Place / cancel module preview      │
 │     Ctrl+D or F1  Open Main Menu                    │
 │   0-9, A-Z, a-z,  Insert Character                  │
 │    ! : % / = # *                                    │

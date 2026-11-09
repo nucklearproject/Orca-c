@@ -9,6 +9,12 @@
 #include "vmio.h"
 #include <getopt.h>
 #include <locale.h>
+#include <dirent.h>
+#include <limits.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <term.h>
+#include <unistd.h>
 
 #define SOKOL_IMPL
 #include "sokol_time.h"
@@ -29,6 +35,10 @@ static int spin_track_timeout = 0;
 #endif
 
 #define staticni ORCA_NOINLINE static
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 staticni void usage(void) { // clang-format off
 fprintf(stderr,
@@ -874,6 +884,7 @@ typedef struct {
   Field field;
   Field scratch_field;
   Field clipboard_field;
+  Field module_preview;
   Mbuf_reusable mbuf_r;
   Undo_history undo_hist;
   Oevent_list oevent_list;
@@ -905,12 +916,16 @@ typedef struct {
   bool is_mouse_down : 1;
   bool is_mouse_dragging : 1;
   bool is_hud_visible : 1;
+  bool module_preview_active : 1;
+  Usz module_preview_previous_h, module_preview_previous_w;
+  Ged_input_mode module_preview_previous_mode;
 } Ged;
 
 static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   field_init(&a->field);
   field_init(&a->scratch_field);
   field_init(&a->clipboard_field);
+  field_init(&a->module_preview);
   mbuf_reusable_init(&a->mbuf_r);
   undo_history_init(&a->undo_hist, undo_limit);
   oevent_list_init(&a->oevent_list);
@@ -942,12 +957,16 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->is_mouse_down = false;
   a->is_mouse_dragging = false;
   a->is_hud_visible = false;
+  a->module_preview_active = false;
+  a->module_preview_previous_h = a->module_preview_previous_w = 1;
+  a->module_preview_previous_mode = Ged_input_mode_normal;
 }
 
 static void ged_deinit(Ged *a) {
   field_deinit(&a->field);
   field_deinit(&a->scratch_field);
   field_deinit(&a->clipboard_field);
+  field_deinit(&a->module_preview);
   mbuf_reusable_deinit(&a->mbuf_r);
   undo_history_deinit(&a->undo_hist);
   oevent_list_deinit(&a->oevent_list);
@@ -1407,6 +1426,42 @@ staticni void ged_set_window_size(Ged *a, int win_h, int win_w,
   ged_make_cursor_visible(a);
 }
 
+staticni void ged_draw_module_preview(Ged *a, WINDOW *win) {
+  int draw_y = 0, draw_x = 0;
+  int scroll_y = a->grid_scroll_y, scroll_x = a->grid_scroll_x;
+  if (scroll_y < 0) {
+    draw_y = -scroll_y;
+    scroll_y = 0;
+  }
+  if (scroll_x < 0) {
+    draw_x = -scroll_x;
+    scroll_x = 0;
+  }
+  Field const *module = &a->module_preview;
+  Usz origin_y = a->ged_cursor.y, origin_x = a->ged_cursor.x;
+  for (Usz y = 0; y < module->height; ++y) {
+    for (Usz x = 0; x < module->width; ++x) {
+      Glyph glyph = module->buffer[y * module->width + x];
+      if (glyph == '.')
+        continue;
+      Isz screen_y = (Isz)(origin_y + y) - scroll_y + draw_y;
+      Isz screen_x = (Isz)(origin_x + x) - scroll_x + draw_x;
+      if (screen_y < 0 || screen_x < 0 || screen_y >= a->grid_h ||
+          screen_x >= a->win_w)
+        continue;
+      bool overlaps = origin_y + y < a->field.height &&
+                      origin_x + x < a->field.width &&
+                      a->field.buffer[(origin_y + y) * a->field.width +
+                                      origin_x + x] != '.';
+      attr_t attr = A_reverse | A_bold |
+                    fg_bg(overlaps ? C_red : C_cyan, C_natural);
+      chtype ch = (chtype)glyph | attr;
+      wmove(win, (int)screen_y, (int)screen_x);
+      waddchnstr(win, &ch, 1);
+    }
+  }
+}
+
 staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
                        bool use_fancy_dots, bool use_fancy_rulers) {
   // We can predictavely step the next simulation tick and then use the
@@ -1436,6 +1491,8 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
       win, 0, 0, a->grid_h, win_w, a->field.buffer, a->mbuf_r.buffer,
       a->field.height, a->field.width, a->grid_scroll_y, a->grid_scroll_x,
       a->ruler_spacing_y, a->ruler_spacing_x, use_fancy_dots, use_fancy_rulers);
+  if (a->module_preview_active)
+    ged_draw_module_preview(a, win);
   draw_grid_cursor(win, 0, 0, a->grid_h, win_w, a->field.buffer,
                    a->field.height, a->field.width, a->grid_scroll_y,
                    a->grid_scroll_x, a->ged_cursor.y, a->ged_cursor.x,
@@ -1576,6 +1633,25 @@ typedef enum {
   Ged_dir_left,
   Ged_dir_right,
 } Ged_dir;
+
+typedef struct {
+  int up, down, left, right;
+} Tui_modified_arrow_keys;
+static Tui_modified_arrow_keys tui_ctrl_arrow_keys = {-1, -1, -1, -1};
+
+static int tui_terminfo_key_code(char const *name) {
+  char *sequence = tigetstr((char *)name);
+  if (!sequence || sequence == (char *)-1)
+    return -1;
+  return key_defined(sequence);
+}
+
+static void tui_init_ctrl_arrow_keys(void) {
+  tui_ctrl_arrow_keys.up = tui_terminfo_key_code("kUP5");
+  tui_ctrl_arrow_keys.down = tui_terminfo_key_code("kDN5");
+  tui_ctrl_arrow_keys.left = tui_terminfo_key_code("kLFT5");
+  tui_ctrl_arrow_keys.right = tui_terminfo_key_code("kRIT5");
+}
 
 staticni void ged_dir_input(Ged *a, Ged_dir dir, int step_length) {
   switch (a->input_mode) {
@@ -1968,7 +2044,7 @@ static bool hacky_try_save(Field *field, char const *filename) {
 
 enum {
   Main_menu_id = 1,
-  Open_form_id,
+  Open_browser_menu_id,
   Save_as_form_id,
   Set_tempo_form_id,
   Set_grid_dims_form_id,
@@ -2000,6 +2076,7 @@ enum {
   Main_menu_opers_guide,
   Main_menu_new,
   Main_menu_open,
+  Main_menu_import_module,
   Main_menu_save,
   Main_menu_save_as,
   Main_menu_set_tempo,
@@ -2014,11 +2091,163 @@ enum {
 #endif
 };
 
+enum {
+  File_browser_parent_id = 1,
+  File_browser_previous_id,
+  File_browser_next_id,
+  File_browser_empty_id,
+  File_browser_entry_id_base = 100,
+  File_browser_page_size = 8,
+};
+typedef struct {
+  char *name;
+  bool is_dir;
+} File_browser_entry;
+static char file_browser_path[PATH_MAX];
+static char file_browser_title[96];
+static char save_as_title[96];
+static char executable_directory[PATH_MAX];
+static File_browser_entry *file_browser_entries;
+static Usz file_browser_entries_count;
+static Usz file_browser_entries_capacity;
+static Usz file_browser_page;
+static bool file_browser_import_mode;
+
+static void file_browser_clear_entries(void) {
+  for (Usz i = 0; i < file_browser_entries_count; ++i)
+    free(file_browser_entries[i].name);
+  free(file_browser_entries);
+  file_browser_entries = NULL;
+  file_browser_entries_count = file_browser_entries_capacity = 0;
+}
+
+static bool file_browser_add_entry(char const *name, bool is_dir) {
+  if (file_browser_entries_count == file_browser_entries_capacity) {
+    Usz cap = file_browser_entries_capacity ? file_browser_entries_capacity * 2 : 32;
+    File_browser_entry *entries = realloc(file_browser_entries, cap * sizeof *entries);
+    if (!entries)
+      return false;
+    file_browser_entries = entries;
+    file_browser_entries_capacity = cap;
+  }
+  size_t len = strlen(name);
+  char *copy = malloc(len + 1);
+  if (!copy)
+    return false;
+  memcpy(copy, name, len + 1);
+  file_browser_entries[file_browser_entries_count++] = (File_browser_entry){copy, is_dir};
+  return true;
+}
+
+static int file_browser_entry_compare(void const *left, void const *right) {
+  File_browser_entry const *a = left, *b = right;
+  if (a->is_dir != b->is_dir)
+    return a->is_dir ? -1 : 1;
+  int cmp = strcasecmp(a->name, b->name);
+  return cmp ? cmp : strcmp(a->name, b->name);
+}
+
+static bool file_browser_join(char *out, size_t cap, char const *dir,
+                              char const *name) {
+  int n = snprintf(out, cap, "%s%s%s", dir,
+                   dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/", name);
+  return n >= 0 && (size_t)n < cap;
+}
+
+static bool file_browser_is_root(void) {
+  return strcmp(file_browser_path, "/") == 0;
+}
+
+static void file_browser_go_parent(void) {
+  size_t len = strlen(file_browser_path);
+  while (len > 1 && file_browser_path[len - 1] == '/')
+    file_browser_path[--len] = '\0';
+  while (len > 1 && file_browser_path[len - 1] != '/')
+    file_browser_path[--len] = '\0';
+  if (len > 1)
+    file_browser_path[len - 1] = '\0';
+}
+
+static void push_file_browser(void) {
+  if (!file_browser_path[0] && !getcwd(file_browser_path, sizeof file_browser_path))
+    snprintf(file_browser_path, sizeof file_browser_path, ".");
+  file_browser_clear_entries();
+  DIR *dir = opendir(file_browser_path);
+  if (!dir) {
+    qmsg_printf_push("Open", "Cannot read directory:\n%s", file_browser_path);
+    return;
+  }
+  struct dirent *de;
+  bool allocation_failed = false;
+  while ((de = readdir(dir))) {
+    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+      continue;
+    char fullpath[PATH_MAX];
+    if (!file_browser_join(fullpath, sizeof fullpath, file_browser_path,
+                           de->d_name))
+      continue;
+    struct stat st;
+    if (stat(fullpath, &st) != 0 ||
+        (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)))
+      continue;
+    if (!file_browser_add_entry(de->d_name, S_ISDIR(st.st_mode))) {
+      allocation_failed = true;
+      break;
+    }
+  }
+  closedir(dir);
+  if (allocation_failed) {
+    file_browser_clear_entries();
+    qmsg_printf_push("Open", "Not enough memory to list this directory.");
+    return;
+  }
+  qsort(file_browser_entries, file_browser_entries_count,
+        sizeof *file_browser_entries, file_browser_entry_compare);
+
+  Usz pages = (file_browser_entries_count + File_browser_page_size - 1) /
+              File_browser_page_size;
+  if (pages == 0)
+    pages = 1;
+  if (file_browser_page >= pages)
+    file_browser_page = pages - 1;
+  Qmenu *qm = qmenu_create(Open_browser_menu_id);
+  size_t path_len = strlen(file_browser_path);
+  char const *title_prefix =
+      file_browser_import_mode ? "Import module: " : "Open: ";
+  size_t path_limit = sizeof file_browser_title - strlen(title_prefix) - 5;
+  if (path_len > path_limit)
+    snprintf(file_browser_title, sizeof file_browser_title, "%s...%s",
+             title_prefix, file_browser_path + path_len - path_limit);
+  else
+    snprintf(file_browser_title, sizeof file_browser_title, "%s%s",
+             title_prefix, file_browser_path);
+  qmenu_set_title(qm, file_browser_title);
+  if (!file_browser_is_root())
+    qmenu_add_choice(qm, File_browser_parent_id, ".. (parent folder)");
+  if (file_browser_page > 0)
+    qmenu_add_choice(qm, File_browser_previous_id, "< Previous page");
+  Usz first = file_browser_page * File_browser_page_size;
+  Usz last = first + File_browser_page_size;
+  if (last > file_browser_entries_count)
+    last = file_browser_entries_count;
+  for (Usz i = first; i < last; ++i) {
+    File_browser_entry const *entry = &file_browser_entries[i];
+    qmenu_add_printf(qm, File_browser_entry_id_base + (int)(i - first),
+                     "%s%s", entry->is_dir ? "[D] " : "    ", entry->name);
+  }
+  if (file_browser_entries_count == 0)
+    qmenu_add_choice(qm, File_browser_empty_id, "(no files or folders)");
+  if (file_browser_page + 1 < pages)
+    qmenu_add_choice(qm, File_browser_next_id, "> Next page");
+  qmenu_push_to_nav(qm);
+}
+
 static void push_main_menu(void) {
   Qmenu *qm = qmenu_create(Main_menu_id);
   qmenu_set_title(qm, "ORCA");
   qmenu_add_choice(qm, Main_menu_new, "New");
   qmenu_add_choice(qm, Main_menu_open, "Open...");
+  qmenu_add_choice(qm, Main_menu_import_module, "Import as module...");
   qmenu_add_choice(qm, Main_menu_save, "Save");
   qmenu_add_choice(qm, Main_menu_save_as, "Save As...");
   qmenu_add_spacer(qm);
@@ -2176,6 +2405,9 @@ static void push_controls_msg(void) {
   static struct Ctrl_item items[] = {
       {"Ctrl+Q", "Quit"},
       {"Arrow Keys", "Move Cursor"},
+      {"Ctrl+H/J/K/L", "Move by ruler spacing"},
+      {"Ctrl+Arrow Keys", "Move by ruler spacing"},
+      {"Enter / Escape", "Place / cancel module preview"},
       {"Ctrl+D or F1", "Open Main Menu"},
       {"0-9, A-Z, a-z,", "Insert Character"},
       {"! : % / = # *", NULL},
@@ -2295,9 +2527,6 @@ static void push_opers_guide_msg(void) {
     waddstr(w, items[i].desc);
   }
 }
-static void push_open_form(char const *initial) {
-  qform_single_line_input(Open_form_id, "Open", initial);
-}
 staticni bool try_save_with_msg(Field *field, oso const *str) {
   if (!osolen(str))
     return false;
@@ -2312,7 +2541,21 @@ staticni bool try_save_with_msg(Field *field, oso const *str) {
   return ok;
 }
 static void push_save_as_form(char const *initial) {
-  qform_single_line_input(Save_as_form_id, "Save As", initial);
+  char const *dir = executable_directory[0] ? executable_directory : ".";
+  char const *last = strrchr(dir, '/');
+  last = last ? last + 1 : dir;
+  char const *shown_dir = last;
+  if (last > dir) {
+    char const *prev = last - 1;
+    while (prev > dir && prev[-1] != '/')
+      --prev;
+    shown_dir = prev;
+  }
+  snprintf(save_as_title, sizeof save_as_title, "Save As: ...%s", shown_dir);
+  Qform *qf = qform_create(Save_as_form_id);
+  qform_set_title(qf, save_as_title);
+  qform_add_line_input(qf, 1, initial);
+  qform_push_to_nav(qf);
 }
 static void push_set_tempo_form(Usz initial) {
   char buff[64];
@@ -2837,11 +3080,207 @@ staticni void tui_adjust_term_size(Tui *t, WINDOW **cont_window) {
                       t->softmargin_x);
 }
 
+static oso *tui_save_as_initial_name(Tui *t) {
+  char const *current = osoc(t->file_name);
+  char const *basename = NULL;
+  if (osolen(t->file_name) > 0) {
+    basename = strrchr(current, '/');
+    basename = basename ? basename + 1 : current;
+  }
+  if (!basename || !basename[0])
+    basename = "untitled.orca";
+  oso *name = NULL;
+  osoput(&name, basename);
+  return name;
+}
+
+static void tui_push_save_as_form(Tui *t) {
+  oso *initial = tui_save_as_initial_name(t);
+  push_save_as_form(osoc(initial));
+  osofree(initial);
+}
+
 static void tui_try_save(Tui *t) {
   if (osolen(t->file_name) > 0)
     try_save_with_msg(&t->ged.field, t->file_name);
   else
-    push_save_as_form("");
+    tui_push_save_as_form(t);
+}
+
+static bool tui_begin_module_preview(Tui *t, char const *path) {
+  Ged *a = &t->ged;
+  field_deinit(&a->module_preview);
+  field_init(&a->module_preview);
+  Field_load_error fle = field_load_file(path, &a->module_preview);
+  if (fle != Field_load_error_ok || a->module_preview.height == 0 ||
+      a->module_preview.width == 0) {
+    qmsg_printf_push("Import module", "%s:\n%s", path,
+                     fle == Field_load_error_ok
+                         ? "Not a usable module file"
+                         : field_load_error_string(fle));
+    field_deinit(&a->module_preview);
+    field_init(&a->module_preview);
+    return false;
+  }
+
+  // Crop only the empty outer margin. Dots inside the module remain intact.
+  Usz min_y = a->module_preview.height, min_x = a->module_preview.width;
+  Usz max_y = 0, max_x = 0;
+  bool has_content = false;
+  for (Usz y = 0; y < a->module_preview.height; ++y) {
+    for (Usz x = 0; x < a->module_preview.width; ++x) {
+      if (a->module_preview.buffer[y * a->module_preview.width + x] == '.')
+        continue;
+      if (!has_content || y < min_y)
+        min_y = y;
+      if (!has_content || x < min_x)
+        min_x = x;
+      if (!has_content || y > max_y)
+        max_y = y;
+      if (!has_content || x > max_x)
+        max_x = x;
+      has_content = true;
+    }
+  }
+  if (!has_content) {
+    qmsg_printf_push("Import module", "%s:\nModule contains no content.",
+                     path);
+    field_deinit(&a->module_preview);
+    field_init(&a->module_preview);
+    return false;
+  }
+  if (min_y != 0 || min_x != 0 || max_y + 1 != a->module_preview.height ||
+      max_x + 1 != a->module_preview.width) {
+    Field trimmed;
+    field_init(&trimmed);
+    Usz trimmed_h = max_y - min_y + 1;
+    Usz trimmed_w = max_x - min_x + 1;
+    field_resize_raw(&trimmed, trimmed_h, trimmed_w);
+    gbuffer_copy_subrect(a->module_preview.buffer, trimmed.buffer,
+                         a->module_preview.height, a->module_preview.width,
+                         trimmed.height, trimmed.width, min_y, min_x, 0, 0,
+                         trimmed_h, trimmed_w);
+    field_deinit(&a->module_preview);
+    a->module_preview = trimmed;
+  }
+  a->module_preview_previous_h = a->ged_cursor.h;
+  a->module_preview_previous_w = a->ged_cursor.w;
+  a->module_preview_previous_mode = a->input_mode;
+  a->module_preview_active = true;
+  a->input_mode = Ged_input_mode_normal;
+  a->ged_cursor.h = a->ged_cursor.w = 1;
+  ged_make_cursor_visible(a);
+  a->is_draw_dirty = true;
+  return true;
+}
+
+static void tui_end_module_preview(Tui *t, bool keep_module_selection) {
+  Ged *a = &t->ged;
+  if (!a->module_preview_active)
+    return;
+  if (!keep_module_selection) {
+    a->ged_cursor.h = a->module_preview_previous_h;
+    a->ged_cursor.w = a->module_preview_previous_w;
+  }
+  a->input_mode = a->module_preview_previous_mode;
+  a->module_preview_active = false;
+  field_deinit(&a->module_preview);
+  field_init(&a->module_preview);
+  a->is_draw_dirty = true;
+}
+
+static bool tui_import_module(Tui *t, Field const *module) {
+  Field *project = &t->ged.field;
+  Usz origin_y = t->ged.ged_cursor.y;
+  Usz origin_x = t->ged.ged_cursor.x;
+  if (origin_y > ORCA_Y_MAX || origin_x > ORCA_X_MAX ||
+      module->height > (Usz)ORCA_Y_MAX - origin_y ||
+      module->width > (Usz)ORCA_X_MAX - origin_x) {
+    qmsg_printf_push("Import module",
+                     "Module does not fit within Orca's maximum grid size.");
+    return false;
+  }
+
+  // Dots are transparent. Reject occupied-cell collisions before touching
+  // either the project or its undo history.
+  for (Usz y = 0; y < module->height; ++y) {
+    for (Usz x = 0; x < module->width; ++x) {
+      Glyph glyph = module->buffer[y * module->width + x];
+      Usz dest_y = origin_y + y, dest_x = origin_x + x;
+      if (glyph != '.' && dest_y < project->height &&
+          dest_x < project->width &&
+          project->buffer[dest_y * project->width + dest_x] != '.') {
+        qmsg_printf_push("Import cancelled",
+                         "Module overlaps occupied cell at %zu,%zu.",
+                         dest_x, dest_y);
+        return false;
+      }
+    }
+  }
+
+  Usz new_height = origin_y + module->height;
+  Usz new_width = origin_x + module->width;
+  if (new_height < project->height)
+    new_height = project->height;
+  if (new_width < project->width)
+    new_width = project->width;
+  if (new_height != project->height || new_width != project->width) {
+    ged_resize_grid(project, &t->ged.mbuf_r, new_height, new_width,
+                    t->ged.tick_num, &t->ged.scratch_field,
+                    &t->ged.undo_hist, &t->ged.ged_cursor);
+  } else {
+    undo_history_push(&t->ged.undo_hist, project, t->ged.tick_num);
+  }
+
+  for (Usz y = 0; y < module->height; ++y) {
+    for (Usz x = 0; x < module->width; ++x) {
+      Glyph glyph = module->buffer[y * module->width + x];
+      if (glyph != '.')
+        project->buffer[(origin_y + y) * project->width + origin_x + x] = glyph;
+    }
+  }
+  t->ged.ged_cursor.w = module->width;
+  t->ged.ged_cursor.h = module->height;
+  ged_update_internal_geometry(&t->ged);
+  ged_make_cursor_visible(&t->ged);
+  t->ged.needs_remarking = true;
+  t->ged.is_draw_dirty = true;
+  return true;
+}
+
+static void tui_init_executable_directory(char const *argv0) {
+  char executable[PATH_MAX];
+  ssize_t length = -1;
+#if defined(__linux__)
+  length = readlink("/proc/self/exe", executable, sizeof executable - 1);
+#endif
+  if (length >= 0 && (size_t)length < sizeof executable) {
+    executable[length] = '\0';
+  } else if (argv0 && argv0[0] == '/') {
+    snprintf(executable, sizeof executable, "%s", argv0);
+  } else {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof cwd)) {
+      if (argv0 && strchr(argv0, '/'))
+        snprintf(executable, sizeof executable, "%s/%s", cwd, argv0);
+      else
+        snprintf(executable, sizeof executable, "%s/%s", cwd,
+                 argv0 ? argv0 : "orca");
+    } else {
+      snprintf(executable, sizeof executable, "%s", argv0 ? argv0 : "orca");
+    }
+  }
+  char *slash = strrchr(executable, '/');
+  if (slash) {
+    if (slash == executable)
+      slash[1] = '\0';
+    else
+      *slash = '\0';
+    snprintf(executable_directory, sizeof executable_directory, "%s",
+             executable);
+  } else {
+    snprintf(executable_directory, sizeof executable_directory, ".");
+  }
 }
 
 typedef enum {
@@ -2912,13 +3351,22 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
           push_confirm_new_file_menu();
           break;
         case Main_menu_open:
-          push_open_form(osoc(t->file_name));
+          file_browser_path[0] = '\0';
+          file_browser_page = 0;
+          file_browser_import_mode = false;
+          push_file_browser();
+          break;
+        case Main_menu_import_module:
+          file_browser_path[0] = '\0';
+          file_browser_page = 0;
+          file_browser_import_mode = true;
+          push_file_browser();
           break;
         case Main_menu_save:
           tui_try_save(t);
           break;
         case Main_menu_save_as:
-          push_save_as_form(osoc(t->file_name));
+          tui_push_save_as_form(t);
           break;
         case Main_menu_set_tempo:
           push_set_tempo_form(t->ged.bpm);
@@ -2936,6 +3384,79 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
 #endif
         }
         break;
+      case Open_browser_menu_id: {
+        int picked = act.picked.id;
+        if (picked == File_browser_parent_id) {
+          file_browser_go_parent();
+          file_browser_page = 0;
+          qnav_stack_pop();
+          push_file_browser();
+        } else if (picked == File_browser_previous_id ||
+                   picked == File_browser_next_id) {
+          if (picked == File_browser_previous_id && file_browser_page > 0)
+            --file_browser_page;
+          else if (picked == File_browser_next_id)
+            ++file_browser_page;
+          qnav_stack_pop();
+          push_file_browser();
+        } else if (picked >= File_browser_entry_id_base) {
+          Usz index = file_browser_page * File_browser_page_size +
+                      (Usz)(picked - File_browser_entry_id_base);
+          if (index < file_browser_entries_count) {
+            File_browser_entry const *entry = &file_browser_entries[index];
+            char selected_path[PATH_MAX];
+            if (file_browser_join(selected_path, sizeof selected_path,
+                                  file_browser_path, entry->name)) {
+              if (entry->is_dir) {
+                if (strlen(selected_path) < sizeof file_browser_path) {
+                  strcpy(file_browser_path, selected_path);
+                  file_browser_page = 0;
+                  qnav_stack_pop();
+                  push_file_browser();
+                }
+              } else if (file_browser_import_mode) {
+                qnav_stack_pop();
+                if (tui_begin_module_preview(t, selected_path))
+                  pop_qnav_if_main_menu();
+              } else {
+                oso *temp_name = NULL;
+                osoput(&temp_name, selected_path);
+                qnav_stack_pop();
+                bool added_hist = undo_history_push(&t->ged.undo_hist,
+                                                    &t->ged.field,
+                                                    t->ged.tick_num);
+                Field_load_error fle =
+                    field_load_file(osoc(temp_name), &t->ged.field);
+                if (fle == Field_load_error_ok && t->ged.field.height > 0 &&
+                    t->ged.field.width > 0) {
+                  osoputoso(&t->file_name, temp_name);
+                  mbuf_reusable_ensure_size(&t->ged.mbuf_r,
+                                            t->ged.field.height,
+                                            t->ged.field.width);
+                  ged_cursor_confine(&t->ged.ged_cursor, t->ged.field.height,
+                                     t->ged.field.width);
+                  ged_update_internal_geometry(&t->ged);
+                  ged_make_cursor_visible(&t->ged);
+                  t->ged.needs_remarking = true;
+                  t->ged.is_draw_dirty = true;
+                  pop_qnav_if_main_menu();
+                } else {
+                  if (added_hist)
+                    undo_history_pop(&t->ged.undo_hist, &t->ged.field,
+                                     &t->ged.tick_num);
+                  qmsg_printf_push("Error Loading File", "%s:\n%s",
+                                   osoc(temp_name),
+                                   fle == Field_load_error_ok
+                                       ? "Not a usable file"
+                                       : field_load_error_string(fle));
+                }
+                osofree(temp_name);
+              }
+            }
+          }
+        }
+        break;
+      }
       case Autofit_menu_id: {
         Usz new_field_h, new_field_w;
         bool did_get_ok_size = false;
@@ -3090,43 +3611,24 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         break;
       case Qform_action_type_submitted: {
         switch (qform_id(qf)) {
-        case Open_form_id: {
+        case Save_as_form_id: {
           oso *temp_name = qform_get_nonempty_single_line_input(qf);
           if (!temp_name)
             break;
           expand_home_tilde(&temp_name);
           if (!temp_name)
             break;
-          bool added_hist = undo_history_push(&t->ged.undo_hist, &t->ged.field,
-                                              t->ged.tick_num);
-          Field_load_error fle =
-              field_load_file(osoc(temp_name), &t->ged.field);
-          if (fle == Field_load_error_ok) {
-            qnav_stack_pop();
-            osoputoso(&t->file_name, temp_name);
-            mbuf_reusable_ensure_size(&t->ged.mbuf_r, t->ged.field.height,
-                                      t->ged.field.width);
-            ged_cursor_confine(&t->ged.ged_cursor, t->ged.field.height,
-                               t->ged.field.width);
-            ged_update_internal_geometry(&t->ged);
-            ged_make_cursor_visible(&t->ged);
-            t->ged.needs_remarking = true;
-            t->ged.is_draw_dirty = true;
-            pop_qnav_if_main_menu();
-          } else {
-            if (added_hist)
-              undo_history_pop(&t->ged.undo_hist, &t->ged.field,
-                               &t->ged.tick_num);
-            qmsg_printf_push("Error Loading File", "%s:\n%s", osoc(temp_name),
-                             field_load_error_string(fle));
+          if (osoc(temp_name)[0] != '/') {
+            oso *full_path = NULL;
+            osoput(&full_path,
+                   executable_directory[0] ? executable_directory : ".");
+            if (osolen(full_path) > 0 &&
+                osoc(full_path)[osolen(full_path) - 1] != '/')
+              osocat(&full_path, "/");
+            osocat(&full_path, osoc(temp_name));
+            osofree(temp_name);
+            temp_name = full_path;
           }
-          osofree(temp_name);
-          break;
-        }
-        case Save_as_form_id: {
-          oso *temp_name = qform_get_nonempty_single_line_input(qf);
-          if (!temp_name)
-            break;
           qnav_stack_pop();
           bool saved_ok = try_save_with_msg(&t->ged.field, temp_name);
           if (saved_ok)
@@ -3353,6 +3855,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expected only 1 file argument.\n");
     exit(1);
   }
+  tui_init_executable_directory(argv[0]);
   qnav_init(); // Initialize the menu/navigation global state
   // Initialize the 'Grid EDitor' stuff. This sits underneath the TUI.
   ged_init(&t.ged, (Usz)t.undo_history_limit, (Usz)init_bpm, (Usz)init_seed);
@@ -3382,6 +3885,7 @@ int main(int argc, char **argv) {
   raw();
   noecho();                // Don't echo keyboard input
   keypad(stdscr, TRUE);    // Also receive arrow keys, etc.
+  tui_init_ctrl_arrow_keys();
   curs_set(0);             // Hide the terminal cursor
   set_escdelay(1);         // Short delay before triggering escape
   term_util_init_colors(); // Our color init routine
@@ -3608,14 +4112,59 @@ event_loop:;
     goto event_loop;
   }
 
+  // Module placement is a preview-only state until Enter commits it.
+  if (t.ged.module_preview_active) {
+    if (key == 27) {
+      tui_end_module_preview(&t, false);
+      goto event_loop;
+    }
+    if (key == '\r' || key == '\n' || key == KEY_ENTER) {
+      if (tui_import_module(&t, &t.ged.module_preview))
+        tui_end_module_preview(&t, true);
+      goto event_loop;
+    }
+    bool is_preview_move = key == KEY_UP || key == KEY_DOWN ||
+                           key == KEY_LEFT || key == KEY_RIGHT ||
+                           key == CTRL_PLUS('h') || key == CTRL_PLUS('j') ||
+                           key == CTRL_PLUS('k') || key == CTRL_PLUS('l') ||
+                           key == tui_ctrl_arrow_keys.up ||
+                           key == tui_ctrl_arrow_keys.down ||
+                           key == tui_ctrl_arrow_keys.left ||
+                           key == tui_ctrl_arrow_keys.right || key == 566 ||
+                           key == 525 || key == 545 || key == 560;
+    if (key != CTRL_PLUS('q') && !is_preview_move)
+      goto event_loop;
+  }
+
   // Regular inputs when we're not in a menu and not in bracketed paste.
+  // ncurses assigns modified-arrow key codes from the active terminfo entry;
+  // these vary between builds, so discover Ctrl+Arrow codes at runtime.
+  if (key != ERR && key == tui_ctrl_arrow_keys.up) {
+    ged_dir_input(&t.ged, Ged_dir_up, (int)t.ged.ruler_spacing_y);
+    goto event_loop;
+  }
+  if (key != ERR && key == tui_ctrl_arrow_keys.down) {
+    ged_dir_input(&t.ged, Ged_dir_down, (int)t.ged.ruler_spacing_y);
+    goto event_loop;
+  }
+  if (key != ERR && key == tui_ctrl_arrow_keys.left) {
+    ged_dir_input(&t.ged, Ged_dir_left, (int)t.ged.ruler_spacing_x);
+    goto event_loop;
+  }
+  if (key != ERR && key == tui_ctrl_arrow_keys.right) {
+    ged_dir_input(&t.ged, Ged_dir_right, (int)t.ged.ruler_spacing_x);
+    goto event_loop;
+  }
   switch (key) {
   // Checking again for 'quit' here, because it's only listened for if we're
   // in the menus or *not* in bracketed paste mode.
   case CTRL_PLUS('q'):
     goto quit;
   case CTRL_PLUS('o'):
-    push_open_form(osoc(t.file_name));
+    file_browser_path[0] = '\0';
+    file_browser_page = 0;
+    file_browser_import_mode = false;
+    push_file_browser();
     break;
   case 127: // backspace in terminal.app, apparently
   case KEY_BACKSPACE:
@@ -3755,20 +4304,28 @@ event_loop:;
 
   // Cursor movement
   case KEY_UP:
-  case CTRL_PLUS('k'):
     ged_dir_input(&t.ged, Ged_dir_up, 1);
     break;
-  case CTRL_PLUS('j'):
+  case CTRL_PLUS('k'):
+    ged_dir_input(&t.ged, Ged_dir_up, (int)t.ged.ruler_spacing_y);
+    break;
   case KEY_DOWN:
     ged_dir_input(&t.ged, Ged_dir_down, 1);
     break;
-  case CTRL_PLUS('h'):
+  case CTRL_PLUS('j'):
+    ged_dir_input(&t.ged, Ged_dir_down, (int)t.ged.ruler_spacing_y);
+    break;
   case KEY_LEFT:
     ged_dir_input(&t.ged, Ged_dir_left, 1);
     break;
-  case CTRL_PLUS('l'):
+  case CTRL_PLUS('h'):
+    ged_dir_input(&t.ged, Ged_dir_left, (int)t.ged.ruler_spacing_x);
+    break;
   case KEY_RIGHT:
     ged_dir_input(&t.ged, Ged_dir_right, 1);
+    break;
+  case CTRL_PLUS('l'):
+    ged_dir_input(&t.ged, Ged_dir_right, (int)t.ged.ruler_spacing_x);
     break;
 
   // Selection size modification. These may not work in all terminals. (Only
