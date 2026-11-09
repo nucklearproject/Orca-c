@@ -16,7 +16,7 @@ Orca is not a synthesizer, but a flexible livecoding environment capable of send
 
 ```sh
 sudo apt-get install git libncurses5-dev libncursesw5-dev libportmidi-dev
-git clone https://github.com/hundredrabbits/Orca-c.git
+git clone https://github.com/nucklearproject/Orca-c.git
 cd Orca-c
 make          # Compile orca
 build/orca    # Run orca
