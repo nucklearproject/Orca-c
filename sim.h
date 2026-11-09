@@ -4,4 +4,4 @@
 
 void orca_run(Glyph *restrict gbuffer, Mark *restrict mbuffer, Usz height,
               Usz width, Usz tick_number, Oevent_list *oevent_list,
-              Usz random_seed);
+              Usz random_seed, U8 const *midi_toggle_states);

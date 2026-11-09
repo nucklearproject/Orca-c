@@ -74,6 +74,7 @@ typedef struct {
   Glyph *vars_slots;
   Oevent_list *oevent_list;
   Usz random_seed;
+  U8 const *midi_toggle_states;
 } Oper_extra_params;
 
 static void oper_poke_and_stun(Glyph *restrict gbuffer, Mark *restrict mbuffer,
@@ -149,6 +150,7 @@ static void oper_poke_and_stun(Glyph *restrict gbuffer, Mark *restrict mbuffer,
 
 #define UNIQUE_OPERATORS(_)                                                    \
   _('!', midicc)                                                               \
+  _('&', midi_toggle)                                                          \
   _('#', comment)                                                              \
   _('%', midi)                                                                 \
   _('*', bang)                                                                 \
@@ -395,6 +397,31 @@ BEGIN_OPERATOR(midipb)
   oe->channel = (U8)channel;
   oe->msb = (U8)(index_of(msb_g) * 127 / 35); // 0~35 -> 0~127
   oe->lsb = (U8)(index_of(lsb_g) * 127 / 35);
+END_OPERATOR
+
+BEGIN_OPERATOR(midi_toggle)
+  PORT(0, 1, IN);
+  PORT(0, 2, IN);
+  PORT(0, 3, IN);
+  PORT(1, 0, OUT);
+  Glyph channel_g = PEEK(0, 1);
+  Glyph octave_g = PEEK(0, 2);
+  Glyph note_g = PEEK(0, 3);
+  if (channel_g == '.' || octave_g == '.' || note_g == '.')
+    return;
+  Usz channel = index_of(channel_g);
+  Usz octave = index_of(octave_g);
+  U8 pitch = midi_note_number_of(note_g);
+  if (channel < 1 || channel > 16 || octave > 9 || pitch == UINT8_MAX)
+    return;
+  // The input operator uses the controller's common C1=36 octave naming.
+  Usz note = octave * 12 + pitch + 24;
+  if (note > 127)
+    return;
+  Usz state_index = (channel - 1) * 128 + note;
+  bool is_on = extra_params->midi_toggle_states &&
+               extra_params->midi_toggle_states[state_index] != 0;
+  POKE(1, 0, is_on ? '1' : '0');
 END_OPERATOR
 
 BEGIN_OPERATOR(add)
@@ -746,13 +773,15 @@ END_OPERATOR
 //////// Run simulation
 
 void orca_run(Glyph *restrict gbuf, Mark *restrict mbuf, Usz height, Usz width,
-              Usz tick_number, Oevent_list *oevent_list, Usz random_seed) {
+              Usz tick_number, Oevent_list *oevent_list, Usz random_seed,
+              U8 const *midi_toggle_states) {
   Glyph vars_slots[Glyphs_index_count];
   memset(vars_slots, '.', sizeof(vars_slots));
   Oper_extra_params extras;
   extras.vars_slots = &vars_slots[0];
   extras.oevent_list = oevent_list;
   extras.random_seed = random_seed;
+  extras.midi_toggle_states = midi_toggle_states;
 
   for (Usz iy = 0; iy < height; ++iy) {
     Glyph const *glyph_row = gbuf + iy * width;

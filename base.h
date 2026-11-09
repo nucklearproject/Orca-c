@@ -100,6 +100,7 @@ static bool orca_is_valid_glyph(Glyph c) {
     return true;
   switch (c) {
   case '!':
+  case '&':
   case '#':
   case '%':
   case '*':

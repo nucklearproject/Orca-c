@@ -94,6 +94,7 @@ static Glyph_class glyph_class_of(Glyph glyph) {
   case 'w':
     return Glyph_class_movement;
   case '!':
+  case '&':
   case ':':
   case ';':
   case '=':
@@ -469,7 +470,9 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        char const *filename, Usz field_h, Usz field_w,
                        Usz ruler_spacing_y, Usz ruler_spacing_x, Usz tick_num,
                        Usz bpm, Ged_cursor const *ged_cursor,
-                       Ged_input_mode input_mode, Usz activity_counter) {
+                       Ged_input_mode input_mode, Usz activity_counter,
+                       bool midi_input_received, int midi_input_channel,
+                       int midi_input_note) {
   (void)height;
   (void)width;
   enum { Tabstop = 8 };
@@ -483,6 +486,10 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   wprintw(win, "%zu", bpm);
   advance_faketab(win, win_x, Tabstop);
   print_activity_indicator(win, activity_counter);
+  if (midi_input_received) {
+    waddstr(win, " IN ");
+    wprintw(win, "%d:%d", midi_input_channel, midi_input_note);
+  }
   wmove(win, win_y + 1, win_x);
   wprintw(win, "%zu,%zu", ged_cursor->x, ged_cursor->y);
   advance_faketab(win, win_x, Tabstop);
@@ -757,6 +764,10 @@ typedef struct {
   PmDeviceID device_id;
   PortMidiStream *stream;
 } Midi_mode_portmidi;
+typedef struct {
+  PmDeviceID device_id;
+  PortMidiStream *stream;
+} Midi_input_mode_portmidi;
 // Not sure whether it's OK to call Pm_Terminate() without having a successful
 // call to Pm_Initialize() -- let's just treat it with tweezers.
 static bool portmidi_is_initialized = false;
@@ -802,6 +813,33 @@ static PmError portmidi_init_if_necessary(void) {
     return e;
   portmidi_is_initialized = true;
   return 0;
+}
+staticni Usz ged_glyph_index(Glyph glyph) {
+  if (glyph >= '0' && glyph <= '9')
+    return (Usz)(glyph - '0');
+  if (glyph >= 'A' && glyph <= 'Z')
+    return (Usz)(glyph - 'A' + 10);
+  if (glyph >= 'a' && glyph <= 'z')
+    return (Usz)(glyph - 'a' + 10);
+  return 0;
+}
+staticni PmError midi_input_init_portmidi(Midi_input_mode_portmidi *mi,
+                                          PmDeviceID dev_id) {
+  PmError e = portmidi_init_if_necessary();
+  if (e)
+    return e;
+  e = Pm_OpenInput(&mi->stream, dev_id, NULL, 64, NULL, NULL);
+  if (e)
+    return e;
+  mi->device_id = dev_id;
+  return pmNoError;
+}
+staticni void midi_input_deinit_portmidi(Midi_input_mode_portmidi *mi) {
+  if (mi->stream) {
+    Pm_Close(mi->stream);
+    mi->stream = NULL;
+  }
+  mi->device_id = (PmDeviceID)-1;
 }
 staticni PmError midi_mode_init_portmidi(Midi_mode *mm, PmDeviceID dev_id) {
   PmError e = portmidi_init_if_necessary();
@@ -900,6 +938,13 @@ typedef struct {
   double time_to_next_note_off;
   Oosc_dev *oosc_dev;
   Midi_mode midi_mode;
+  U8 midi_toggle_states[16 * 128];
+  int midi_last_input_channel;
+  int midi_last_input_note;
+  bool midi_input_received;
+#ifdef FEAT_PORTMIDI
+  Midi_input_mode_portmidi midi_input;
+#endif
   Usz activity_counter;
   Usz random_seed;
   Usz drag_start_y, drag_start_x;
@@ -941,6 +986,14 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->time_to_next_note_off = 1.0;
   a->oosc_dev = NULL;
   midi_mode_init_null(&a->midi_mode);
+  memset(a->midi_toggle_states, 0, sizeof a->midi_toggle_states);
+  a->midi_last_input_channel = 0;
+  a->midi_last_input_note = 0;
+  a->midi_input_received = false;
+#ifdef FEAT_PORTMIDI
+  a->midi_input.device_id = (PmDeviceID)-1;
+  a->midi_input.stream = NULL;
+#endif
   a->activity_counter = 0;
   a->random_seed = init_seed;
   a->drag_start_y = a->drag_start_x = 0;
@@ -975,6 +1028,9 @@ static void ged_deinit(Ged *a) {
   if (a->oosc_dev)
     oosc_dev_destroy(a->oosc_dev);
   midi_mode_deinit(&a->midi_mode);
+#ifdef FEAT_PORTMIDI
+  midi_input_deinit_portmidi(&a->midi_input);
+#endif
 }
 
 static bool ged_is_draw_dirty(Ged *a) {
@@ -1279,13 +1335,81 @@ static double ged_secs_to_deadline(Ged const *a) {
 
 staticni void clear_and_run_vm(Glyph *restrict gbuf, Mark *restrict mbuf,
                                Usz height, Usz width, Usz tick_number,
-                               Oevent_list *oevent_list, Usz random_seed) {
+                               Oevent_list *oevent_list, Usz random_seed,
+                               U8 const *midi_toggle_states) {
   mbuffer_clear(mbuf, height, width);
   oevent_list_clear(oevent_list);
-  orca_run(gbuf, mbuf, height, width, tick_number, oevent_list, random_seed);
+  orca_run(gbuf, mbuf, height, width, tick_number, oevent_list, random_seed,
+           midi_toggle_states);
 }
 
+#ifdef FEAT_PORTMIDI
+static U8 ged_midi_toggle_pitch(Glyph glyph) {
+  int sharp = (glyph & (1 << 5)) != 0;
+  glyph &= (Glyph)~(1 << 5);
+  if (glyph < 'A' || glyph > 'Z')
+    return UINT8_MAX;
+  int degree = glyph <= 'B' ? 'G' - 'B' + glyph - 'A' : glyph - 'C';
+  static U8 const semitones[] = {0, 2, 4, 5, 7, 9, 11};
+  return (U8)(degree / 7 * 12 + semitones[degree % 7] + sharp);
+}
+
+static void ged_update_midi_toggle_cell(Ged *a, int channel, int note) {
+  Field *field = &a->field;
+  for (Usz y = 0; y + 1 < field->height; ++y) {
+    for (Usz x = 0; x + 3 < field->width; ++x) {
+      Glyph *row = field->buffer + y * field->width;
+      if (row[x] != '&')
+        continue;
+      if (row[x + 1] == '.' || row[x + 2] == '.' || row[x + 3] == '.')
+        continue;
+      Usz input_channel = ged_glyph_index(row[x + 1]);
+      Usz octave = ged_glyph_index(row[x + 2]);
+      U8 pitch = ged_midi_toggle_pitch(row[x + 3]);
+      if (input_channel < 1 || input_channel > 16 || octave > 9 ||
+          pitch == UINT8_MAX || (int)(input_channel - 1) != channel ||
+          (int)(octave * 12 + pitch + 24) != note)
+        continue;
+      U8 state = a->midi_toggle_states[channel * 128 + note];
+      field->buffer[(y + 1) * field->width + x] = state ? '1' : '0';
+    }
+  }
+  a->is_draw_dirty = true;
+}
+
+staticni void ged_poll_midi_input(Ged *a) {
+  if (!a->midi_input.stream)
+    return;
+  PmEvent events[32];
+  int count;
+  do {
+    count = Pm_Read(a->midi_input.stream, events, ORCA_ARRAY_COUNTOF(events));
+    for (int i = 0; i < count; ++i) {
+      PmMessage message = events[i].message;
+      int status = Pm_MessageStatus(message);
+      int type = status & 0xF0;
+      int channel = status & 0x0F;
+      int note = Pm_MessageData1(message);
+      int velocity = Pm_MessageData2(message);
+      if ((type == 0x80 || type == 0x90) && note <= 127) {
+        a->midi_last_input_channel = channel + 1;
+        a->midi_last_input_note = note;
+        a->midi_input_received = true;
+        a->is_draw_dirty = true;
+      }
+      if (type != 0x90 || velocity == 0 || note > 127)
+        continue;
+      a->midi_toggle_states[channel * 128 + note] ^= 1;
+      ged_update_midi_toggle_cell(a, channel, note);
+    }
+  } while (count == (int)ORCA_ARRAY_COUNTOF(events));
+}
+#endif
+
 staticni void ged_do_stuff(Ged *a) {
+#ifdef FEAT_PORTMIDI
+  ged_poll_midi_input(a);
+#endif
   if (!a->is_playing)
     return;
   double secs_span = 60.0 / (double)a->bpm / 4.0;
@@ -1342,7 +1466,7 @@ staticni void ged_do_stuff(Ged *a) {
                                 &a->susnote_list, &a->time_to_next_note_off);
   clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
                    a->field.width, a->tick_num, &a->oevent_list,
-                   a->random_seed);
+                   a->random_seed, a->midi_toggle_states);
   ++a->tick_num;
   a->needs_remarking = true;
   a->is_draw_dirty = true;
@@ -1483,7 +1607,7 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
     mbuf_reusable_ensure_size(&a->mbuf_r, a->field.height, a->field.width);
     clear_and_run_vm(a->scratch_field.buffer, a->mbuf_r.buffer, a->field.height,
                      a->field.width, a->tick_num, &a->scratch_oevent_list,
-                     a->random_seed);
+                     a->random_seed, a->midi_toggle_states);
     a->needs_remarking = false;
   }
   int win_w = a->win_w;
@@ -1504,7 +1628,8 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
     draw_hud(win, a->grid_h, hud_x, Hud_height, win_w, filename,
              a->field.height, a->field.width, a->ruler_spacing_y,
              a->ruler_spacing_x, a->tick_num, a->bpm, &a->ged_cursor,
-             a->input_mode, a->activity_counter);
+             a->input_mode, a->activity_counter, a->midi_input_received,
+             a->midi_last_input_channel, a->midi_last_input_note);
   }
   if (a->draw_event_list)
     draw_oevent_list(win, &a->oevent_list);
@@ -1960,7 +2085,7 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     undo_history_push(&a->undo_hist, &a->field, a->tick_num);
     clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
                      a->field.width, a->tick_num, &a->oevent_list,
-                     a->random_seed);
+                     a->random_seed, a->midi_toggle_states);
     ++a->tick_num;
     a->activity_counter += a->oevent_list.count;
     a->needs_remarking = true;
@@ -2060,6 +2185,7 @@ enum {
   Set_fancy_grid_rulers_menu_id,
 #ifdef FEAT_PORTMIDI
   Portmidi_output_device_menu_id,
+  Portmidi_input_device_menu_id,
 #endif
 };
 enum {
@@ -2088,6 +2214,7 @@ enum {
   Main_menu_osc,
 #ifdef FEAT_PORTMIDI
   Main_menu_choose_portmidi_output,
+  Main_menu_choose_portmidi_input,
 #endif
 };
 
@@ -2258,6 +2385,7 @@ static void push_main_menu(void) {
   qmenu_add_choice(qm, Main_menu_osc, "OSC Output...");
 #ifdef FEAT_PORTMIDI
   qmenu_add_choice(qm, Main_menu_choose_portmidi_output, "MIDI Output...");
+  qmenu_add_choice(qm, Main_menu_choose_portmidi_input, "MIDI Input...");
 #endif
   qmenu_add_spacer(qm);
   qmenu_add_choice(qm, Main_menu_playback, "Clock & Timing...");
@@ -2607,6 +2735,36 @@ staticni void push_portmidi_output_device_menu(Midi_mode const *midi_mode) {
   }
   if (has_cur_dev_id) {
     qmenu_set_current_item(qm, cur_dev_id);
+  }
+  qmenu_push_to_nav(qm);
+}
+staticni void push_portmidi_input_device_menu(
+    Midi_input_mode_portmidi const *midi_input) {
+  Qmenu *qm = qmenu_create(Portmidi_input_device_menu_id);
+  qmenu_set_title(qm, "PortMidi Input Device Selection");
+  PmError e = portmidi_init_if_necessary();
+  if (e) {
+    qmenu_destroy(qm);
+    qmsg_printf_push("PortMidi Error",
+                     "PortMidi error during initialization:\n%s",
+                     Pm_GetErrorText(e));
+    return;
+  }
+  int num = Pm_CountDevices();
+  int input_devices = 0;
+  for (int i = 0; i < num; ++i) {
+    PmDeviceInfo const *info = Pm_GetDeviceInfo(i);
+    if (!info || !info->input)
+      continue;
+    bool is_current = midi_input->stream && midi_input->device_id == i;
+    qmenu_add_printf(qm, i, "(%c) #%d - %s", is_current ? '*' : ' ', i,
+                     info->name);
+    ++input_devices;
+  }
+  if (input_devices == 0) {
+    qmenu_destroy(qm);
+    qmsg_printf_push("No PortMidi Devices", "No PortMidi input devices found.");
+    return;
   }
   qmenu_push_to_nav(qm);
 }
@@ -3381,6 +3539,9 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         case Main_menu_choose_portmidi_output:
           push_portmidi_output_device_menu(&t->ged.midi_mode);
           break;
+        case Main_menu_choose_portmidi_input:
+          push_portmidi_input_device_menu(&t->ged.midi_input);
+          break;
 #endif
         }
         break;
@@ -3592,6 +3753,28 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
                            Pm_GetErrorText(pme));
         } else {
           tui_save_prefs(t);
+        }
+        break;
+      }
+      case Portmidi_input_device_menu_id: {
+        midi_input_deinit_portmidi(&t->ged.midi_input);
+        PmError pme = midi_input_init_portmidi(&t->ged.midi_input,
+                                                act.picked.id);
+        memset(t->ged.midi_toggle_states, 0,
+               sizeof t->ged.midi_toggle_states);
+        for (Usz y = 0; y + 1 < t->ged.field.height; ++y) {
+          for (Usz x = 0; x + 3 < t->ged.field.width; ++x) {
+            if (t->ged.field.buffer[y * t->ged.field.width + x] == '&')
+              t->ged.field.buffer[(y + 1) * t->ged.field.width + x] = '0';
+          }
+        }
+        qnav_stack_pop();
+        if (pme) {
+          qmsg_printf_push("PortMidi Error",
+                           "Error setting PortMidi input device:\n%s",
+                           Pm_GetErrorText(pme));
+        } else {
+          t->ged.is_draw_dirty = true;
         }
         break;
       }

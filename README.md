@@ -38,10 +38,17 @@ To choose your MIDI output device, press `F1` (or `Ctrl+D`) to open the main men
 │                     │
 │   OSC Output...     │
 │ > MIDI Output...    │
+│   MIDI Input...     │
 │                     │
 │   Clock & Timing... │
 │.....................│
 ```
+
+### MIDI Input Toggle
+
+Build Orca with PortMidi enabled (`./tool build --portmidi orca`), then choose your controller with `F1` → `MIDI Input...`. The `&` operator listens for a MIDI note-on and toggles the cell directly below it between `0` and `1`. Releasing the key (note-off) does not toggle it.
+
+The syntax is `&channel octave note`, with channels numbered from 1 to 16. For example, `&11C` listens on channel 1 for C1. This implementation maps C1 to MIDI note 36. The HUD shows the last input as `IN channel:note`, which helps confirm the device and note number.
 
 ## Prerequisites
 
@@ -151,7 +158,7 @@ Choose `Import as module...` to select a grid and preview it at the current curs
 │ Enter / Escape   Place / cancel module preview      │
 │     Ctrl+D or F1  Open Main Menu                    │
 │   0-9, A-Z, a-z,  Insert Character                  │
-│    ! : % / = # *                                    │
+│    ! & : % / = # *                                  │
 │         Spacebar  Play/Pause                        │
 │ Ctrl+Z or Ctrl+U  Undo                              │
 │           Ctrl+X  Cut                               │
