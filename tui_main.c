@@ -474,7 +474,6 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        bool midi_input_received, int midi_input_channel,
                        int midi_input_note) {
   (void)height;
-  (void)width;
   enum { Tabstop = 8 };
   wmove(win, win_y, win_x);
   wprintw(win, "%zux%zu", field_w, field_h);
@@ -485,8 +484,13 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   advance_faketab(win, win_x, Tabstop);
   wprintw(win, "%zu", bpm);
   advance_faketab(win, win_x, Tabstop);
+  int activity_y, activity_x;
+  getyx(win, activity_y, activity_x);
   print_activity_indicator(win, activity_counter);
-  if (midi_input_received) {
+  if (midi_input_received && width >= activity_x + 18) {
+    // waddchnstr draws the bar without advancing curses' cursor. Place the
+    // MIDI monitor after all seven segments and a separating space.
+    wmove(win, activity_y, activity_x + 8);
     waddstr(win, " IN ");
     wprintw(win, "%d:%d", midi_input_channel, midi_input_note);
   }
