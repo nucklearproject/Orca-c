@@ -2664,7 +2664,9 @@ staticni bool try_save_with_msg(Field *field, oso const *str) {
     return false;
   bool ok = hacky_try_save(field, osoc(str));
   if (ok) {
-    Qmsg *qm = qmsg_printf_push(NULL, "Saved to:\n%s", osoc(str));
+    char const *filename = strrchr(osoc(str), '/');
+    filename = filename ? filename + 1 : osoc(str);
+    Qmsg *qm = qmsg_printf_push(NULL, "%s", filename);
     qmsg_set_dismiss_mode(qm, Qmsg_dismiss_mode_passthrough);
   } else {
     qmsg_printf_push("Error Saving File", "Unable to save file to:\n%s",
