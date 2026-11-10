@@ -44,11 +44,22 @@ To choose your MIDI output device, press `F1` (or `Ctrl+D`) to open the main men
 │.....................│
 ```
 
-### MIDI Input Toggle
+### MIDI Input Toggle (`&`)
 
-Build Orca with PortMidi enabled (`./tool build --portmidi orca`), then choose your controller with `F1` → `MIDI Input...`. The `&` operator listens for a MIDI note-on and toggles the cell directly below it between `0` and `1`. Releasing the key (note-off) does not toggle it.
+Build Orca with PortMidi enabled (`./tool build --portmidi orca`), then choose a controller with `F1` → `MIDI Input...`. The operator syntax is `&channel octave note`, with channels numbered from 1 to 16. For example, `&31C` listens on channel 3 for C1 (MIDI note 36).
 
-The syntax is `&channel octave note`, with channels numbered from 1 to 16. For example, `&11C` listens on channel 1 for C1. This implementation maps C1 to MIDI note 36. The HUD shows the last input as `IN channel:note`, which helps confirm the device and note number.
+Each matching MIDI note-on toggles the cell directly below `&`: it writes `*` while active and `.` while inactive. A note-off does not toggle the state. The `*` is an Orca bang, so it can activate neighboring lowercase operators such as `d`; `0` and `1` were ordinary data and did not trigger those operators. The HUD shows the last input as `IN channel:note`.
+
+This example listens for C1 on MIDI channel 3. While active, the output `*` bangs `d`; `d4` emits a bang every four frames, triggering `:11D.` to send D1 on MIDI channel 1. When the input toggles off, the output becomes `.` and `d` stops receiving the bang.
+
+```text
+................
+.&31C...........
+..d4............
+...:11D.........
+```
+
+The same grid is included as [`examples/setups/midi-toggle.orca`](examples/setups/midi-toggle.orca).
 
 ## Prerequisites
 

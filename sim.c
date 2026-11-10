@@ -421,7 +421,7 @@ BEGIN_OPERATOR(midi_toggle)
   Usz state_index = (channel - 1) * 128 + note;
   bool is_on = extra_params->midi_toggle_states &&
                extra_params->midi_toggle_states[state_index] != 0;
-  POKE(1, 0, is_on ? '1' : '0');
+  POKE(1, 0, is_on ? '*' : '.');
 END_OPERATOR
 
 BEGIN_OPERATOR(add)

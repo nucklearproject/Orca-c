@@ -1386,7 +1386,7 @@ static void ged_update_midi_toggle_cell(Ged *a, int channel, int note) {
           (int)(octave * 12 + pitch + 24) != note)
         continue;
       U8 state = a->midi_toggle_states[channel * 128 + note];
-      field->buffer[(y + 1) * field->width + x] = state ? '1' : '0';
+      field->buffer[(y + 1) * field->width + x] = state ? '*' : '.';
     }
   }
   a->is_draw_dirty = true;
@@ -2644,7 +2644,7 @@ static void push_controls_msg(void) {
       {"Enter / Escape", "Place / cancel module preview"},
       {"Ctrl+D or F1", "Open Main Menu"},
       {"0-9, A-Z, a-z,", "Insert Character"},
-      {"! : % / = # *", NULL},
+      {"! & : % / = # *", NULL},
       {"Spacebar", "Play/Pause"},
       {"Ctrl+Z or Ctrl+U", "Undo"},
       {"Ctrl+X", "Cut"},
@@ -2730,6 +2730,7 @@ static void push_opers_guide_msg(void) {
       {'X', "write", "Writes operand with offset."},
       {'Y', "jymper", "Outputs westward operand."},
       {'Z', "lerp", "Transitions operand to target."},
+      {'&', "MIDI toggle", "Toggles output * / . on note-on."},
       {'*', "bang", "Bangs neighboring operands."},
       {'#', "comment", "Halts line."},
       // {'*', "self", "Sends ORCA command."},
