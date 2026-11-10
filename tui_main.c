@@ -4400,6 +4400,19 @@ event_loop:;
   case KEY_MOUSE: {
     MEVENT mevent;
     if (cont_window && getmouse(&mevent) == OK) {
+#if defined(NCURSES_MOUSE_VERSION) && NCURSES_MOUSE_VERSION >= 2
+      if (mevent.bstate & (BUTTON4_PRESSED | BUTTON5_PRESSED)) {
+        Qblock *top_block = qnav_top_block();
+        if (t.opers_guide_msg && top_block &&
+            top_block->tag == Qblock_type_qmsg &&
+            qmsg_of(top_block) == t.opers_guide_msg) {
+          int scroll_key =
+              mevent.bstate & BUTTON4_PRESSED ? KEY_UP : KEY_DOWN;
+          tui_scroll_opers_guide(&t, t.opers_guide_msg, scroll_key);
+        }
+        goto event_loop;
+      }
+#endif
       int win_y, win_x;
       int win_h, win_w;
       getbegyx(cont_window, win_y, win_x);
