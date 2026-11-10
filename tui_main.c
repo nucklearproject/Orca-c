@@ -466,6 +466,11 @@ staticni void advance_faketab(WINDOW *win, int offset_x, int tabstop) {
   wmove(win, y, x);
 }
 
+staticni char const *tui_path_basename(char const *path) {
+  char const *slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
 staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        char const *filename, Usz field_h, Usz field_w,
                        Usz ruler_spacing_y, Usz ruler_spacing_x, Usz tick_num,
@@ -519,7 +524,7 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   }
   advance_faketab(win, win_x, Tabstop);
   wattrset(win, A_normal);
-  waddstr(win, filename);
+  waddstr(win, tui_path_basename(filename));
 }
 
 staticni void draw_glyphs_grid(WINDOW *win, int draw_y, int draw_x, int draw_h,
@@ -2664,8 +2669,7 @@ staticni bool try_save_with_msg(Field *field, oso const *str) {
     return false;
   bool ok = hacky_try_save(field, osoc(str));
   if (ok) {
-    char const *filename = strrchr(osoc(str), '/');
-    filename = filename ? filename + 1 : osoc(str);
+    char const *filename = tui_path_basename(osoc(str));
     Qmsg *qm = qmsg_printf_push(NULL, "%s", filename);
     qmsg_set_dismiss_mode(qm, Qmsg_dismiss_mode_passthrough);
   } else {
@@ -3248,8 +3252,7 @@ static oso *tui_save_as_initial_name(Tui *t) {
   char const *current = osoc(t->file_name);
   char const *basename = NULL;
   if (osolen(t->file_name) > 0) {
-    basename = strrchr(current, '/');
-    basename = basename ? basename + 1 : current;
+    basename = tui_path_basename(current);
   }
   if (!basename || !basename[0])
     basename = "untitled.orca";
