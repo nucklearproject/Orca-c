@@ -2697,13 +2697,13 @@ static void push_controls_msg(void) {
     }
   }
 }
-static void push_opers_guide_msg(void) {
-  struct Guide_item {
-    char glyph;
-    char const *name;
-    char const *desc;
-  };
-  static struct Guide_item items[] = {
+typedef struct {
+  char glyph;
+  char const *name;
+  char const *desc;
+} Guide_item;
+
+static Guide_item const opers_guide_items[] = {
       {'A', "add", "Outputs sum of inputs."},
       {'B', "subtract", "Outputs difference of inputs."},
       {'C', "clock", "Outputs modulo of frame."},
@@ -2740,28 +2740,52 @@ static void push_opers_guide_msg(void) {
       // {'%', "mono", "Sends MIDI monophonic note."},
       {'=', "osc", "Sends OSC message."},
       {';', "udp", "Sends UDP message."},
-  };
+};
+
+static int opers_guide_width(void) {
   int w_desc = 0;
-  for (Usz i = 0; i < ORCA_ARRAY_COUNTOF(items); ++i) {
-    if (items[i].desc) {
-      int wr = (int)strlen(items[i].desc);
+  for (Usz i = 0; i < ORCA_ARRAY_COUNTOF(opers_guide_items); ++i) {
+    if (opers_guide_items[i].desc) {
+      int wr = (int)strlen(opers_guide_items[i].desc);
       if (wr > w_desc)
         w_desc = wr;
     }
   }
-  int left_pad = 1, mid_pad = 1, right_pad = 1;
-  int total_width = left_pad + 1 + mid_pad + w_desc + right_pad;
-  Qmsg *qm = qmsg_push(ORCA_ARRAY_COUNTOF(items), total_width);
-  qmsg_set_title(qm, "Operators");
+  return 1 + 1 + 1 + w_desc + 1;
+}
+
+static void draw_opers_guide_msg(Qmsg *qm, Usz scroll_offset) {
   WINDOW *w = qmsg_window(qm);
-  for (int i = 0; i < (int)ORCA_ARRAY_COUNTOF(items); ++i) {
-    wmove(w, i, left_pad);
-    waddch(w, (chtype)items[i].glyph | A_bold);
-    wmove(w, i, left_pad + 1 + mid_pad);
+  int height, width;
+  getmaxyx(w, height, width);
+  (void)width;
+  werase(w);
+  for (int row = 0; row < height; ++row) {
+    Usz item_index = scroll_offset + (Usz)row;
+    if (item_index >= ORCA_ARRAY_COUNTOF(opers_guide_items))
+      break;
+    wmove(w, row, 1);
+    waddch(w, (chtype)opers_guide_items[item_index].glyph | A_bold);
+    wmove(w, row, 3);
     wattrset(w, A_normal);
-    waddstr(w, items[i].desc);
+    waddstr(w, opers_guide_items[item_index].desc);
   }
 }
+
+static Qmsg *push_opers_guide_msg(Usz *out_visible_rows) {
+  int term_h, term_w;
+  getmaxyx(stdscr, term_h, term_w);
+  (void)term_w;
+  Usz visible_rows = term_h > 2 ? (Usz)(term_h - 2) : 1;
+  if (visible_rows > ORCA_ARRAY_COUNTOF(opers_guide_items))
+    visible_rows = ORCA_ARRAY_COUNTOF(opers_guide_items);
+  *out_visible_rows = visible_rows;
+  Qmsg *qm = qmsg_push((int)visible_rows, opers_guide_width());
+  qmsg_set_title(qm, "Operators");
+  draw_opers_guide_msg(qm, 0);
+  return qm;
+}
+
 staticni bool try_save_with_msg(Field *field, oso const *str) {
   if (!osolen(str))
     return false;
@@ -3014,6 +3038,8 @@ typedef struct {
   Ged ged;
   oso *file_name;
   oso *osc_address, *osc_port, *osc_midi_bidule_path;
+  Qmsg *opers_guide_msg;
+  Usz opers_guide_scroll, opers_guide_visible_rows;
   int undo_history_limit;
   int softmargin_y, softmargin_x;
   int hardmargin_y, hardmargin_x;
@@ -3023,6 +3049,52 @@ typedef struct {
   bool osc_output_enabled;
   bool fancy_grid_dots, fancy_grid_rulers;
 } Tui;
+
+static bool tui_scroll_opers_guide(Tui *t, Qmsg *qm, int key) {
+  if (qm != t->opers_guide_msg)
+    return false;
+  Usz max_offset = ORCA_ARRAY_COUNTOF(opers_guide_items) -
+                   t->opers_guide_visible_rows;
+  Usz offset = t->opers_guide_scroll;
+  switch (key) {
+  case KEY_UP:
+    if (offset > 0)
+      --offset;
+    break;
+  case KEY_DOWN:
+    if (offset < max_offset)
+      ++offset;
+    break;
+  case KEY_PPAGE: {
+    Usz page = t->opers_guide_visible_rows > 1
+                   ? t->opers_guide_visible_rows - 1
+                   : 1;
+    offset = offset > page ? offset - page : 0;
+    break;
+  }
+  case KEY_NPAGE: {
+    Usz page = t->opers_guide_visible_rows > 1
+                   ? t->opers_guide_visible_rows - 1
+                   : 1;
+    offset = max_offset - offset < page ? max_offset : offset + page;
+    break;
+  }
+  case KEY_HOME:
+    offset = 0;
+    break;
+  case KEY_END:
+    offset = max_offset;
+    break;
+  default:
+    return false;
+  }
+  if (offset != t->opers_guide_scroll) {
+    t->opers_guide_scroll = offset;
+    draw_opers_guide_msg(t->opers_guide_msg, offset);
+    qnav_stack.occlusion_dirty = true;
+  }
+  return true;
+}
 
 ORCA_OK_IF_UNUSED staticni void print_loading_message(char const *s) {
   Usz len = strlen(s);
@@ -3563,10 +3635,15 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
   switch (qb->tag) {
   case Qblock_type_qmsg: {
     Qmsg *qm = qmsg_of(qb);
+    if (tui_scroll_opers_guide(t, qm, key))
+      break;
     Qmsg_action act;
     if (qmsg_drive(qm, key, &act)) {
-      if (act.dismiss)
+      if (act.dismiss) {
+        if (qm == t->opers_guide_msg)
+          t->opers_guide_msg = NULL;
         qnav_stack_pop();
+      }
       if (act.passthrough)
         return Tui_menus_nothing;
     }
@@ -3607,7 +3684,9 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
           push_controls_msg();
           break;
         case Main_menu_opers_guide:
-          push_opers_guide_msg();
+          t->opers_guide_scroll = 0;
+          t->opers_guide_msg = push_opers_guide_msg(
+              &t->opers_guide_visible_rows);
           break;
         case Main_menu_about:
           push_about_msg();
@@ -4681,7 +4760,8 @@ event_loop:;
     push_controls_msg();
     break;
   case CTRL_PLUS('g'):
-    push_opers_guide_msg();
+    t.opers_guide_scroll = 0;
+    t.opers_guide_msg = push_opers_guide_msg(&t.opers_guide_visible_rows);
     break;
   case CTRL_PLUS('s'):
     tui_try_save(&t);
