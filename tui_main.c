@@ -1,3 +1,7 @@
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include "base.h"
 #include "field.h"
 #include "gbuffer.h"
@@ -471,6 +475,8 @@ staticni char const *tui_path_basename(char const *path) {
   return slash ? slash + 1 : path;
 }
 
+staticni char const *tui_path_display(char const *path);
+
 staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        char const *filename, Usz field_h, Usz field_w,
                        Usz ruler_spacing_y, Usz ruler_spacing_x, Usz tick_num,
@@ -524,7 +530,7 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   }
   advance_faketab(win, win_x, Tabstop);
   wattrset(win, A_normal);
-  waddstr(win, tui_path_basename(filename));
+  waddstr(win, tui_path_display(filename));
 }
 
 staticni void draw_glyphs_grid(WINDOW *win, int draw_y, int draw_x, int draw_h,
@@ -2249,6 +2255,97 @@ static Usz file_browser_entries_capacity;
 static Usz file_browser_page;
 static bool file_browser_import_mode;
 
+staticni char const *tui_path_display(char const *path) {
+  static char cached_input[PATH_MAX];
+  static bool cache_valid;
+  static char relative_path[PATH_MAX];
+  if (!path)
+    return "";
+  if (cache_valid && strcmp(path, cached_input) == 0)
+    return relative_path;
+
+  int copied = snprintf(cached_input, sizeof cached_input, "%s", path);
+  cache_valid = copied >= 0 && (Usz)copied < sizeof cached_input;
+  if (!cache_valid)
+    return path;
+
+  char resolved_file[PATH_MAX];
+  char resolved_executable_directory[PATH_MAX];
+  if (!path[0] || !executable_directory[0] ||
+      !realpath(path, resolved_file) ||
+      !realpath(executable_directory, resolved_executable_directory)) {
+    snprintf(relative_path, sizeof relative_path, "%s",
+             tui_path_basename(path));
+    return relative_path;
+  }
+
+  size_t executable_directory_length = strlen(resolved_executable_directory);
+  if (strncmp(resolved_file, resolved_executable_directory,
+              executable_directory_length) == 0 &&
+      (resolved_file[executable_directory_length] == '/' ||
+       resolved_file[executable_directory_length] == '\0')) {
+    char const *relative = resolved_file + executable_directory_length;
+    while (*relative == '/')
+      ++relative;
+    snprintf(relative_path, sizeof relative_path, "%s",
+             relative[0] ? relative : ".");
+    return relative_path;
+  }
+
+  size_t common_length = 0;
+  while (resolved_executable_directory[common_length] &&
+         resolved_file[common_length] &&
+         resolved_executable_directory[common_length] ==
+             resolved_file[common_length])
+    ++common_length;
+  while (common_length > 0 &&
+         resolved_executable_directory[common_length - 1] != '/')
+    --common_length;
+
+  Usz parent_count = 0;
+  char const *parent = resolved_executable_directory + common_length;
+  while (*parent) {
+    while (*parent == '/')
+      ++parent;
+    if (!*parent)
+      break;
+    ++parent_count;
+    while (*parent && *parent != '/')
+      ++parent;
+  }
+
+  size_t used = 0;
+  bool overflow = false;
+  for (Usz i = 0; i < parent_count; ++i) {
+    int written = snprintf(relative_path + used, sizeof relative_path - used,
+                           "%s..", used ? "/" : "");
+    if (written < 0 || (Usz)written >= sizeof relative_path - used) {
+      overflow = true;
+      break;
+    }
+    used += (size_t)written;
+  }
+
+  char const *target = resolved_file + common_length;
+  while (*target == '/')
+    ++target;
+  if (!overflow && *target) {
+    int written = snprintf(relative_path + used, sizeof relative_path - used,
+                           "%s%s", used ? "/" : "", target);
+    if (written < 0 || (Usz)written >= sizeof relative_path - used)
+      overflow = true;
+    else
+      used += (size_t)written;
+  }
+  if (overflow) {
+    snprintf(relative_path, sizeof relative_path, "%s", path);
+    return relative_path;
+  }
+  if (used == 0)
+    snprintf(relative_path, sizeof relative_path, ".");
+  return relative_path;
+}
+
 static void file_browser_clear_entries(void) {
   for (Usz i = 0; i < file_browser_entries_count; ++i)
     free(file_browser_entries[i].name);
@@ -2669,7 +2766,7 @@ staticni bool try_save_with_msg(Field *field, oso const *str) {
     return false;
   bool ok = hacky_try_save(field, osoc(str));
   if (ok) {
-    char const *filename = tui_path_basename(osoc(str));
+    char const *filename = tui_path_display(osoc(str));
     Qmsg *qm = qmsg_printf_push(NULL, "%s", filename);
     qmsg_set_dismiss_mode(qm, Qmsg_dismiss_mode_passthrough);
   } else {
