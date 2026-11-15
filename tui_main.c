@@ -1989,6 +1989,40 @@ staticni bool ged_fill_selection_with_char(Ged *a, Glyph c) {
   return true;
 }
 
+staticni bool ged_comment_selection(Ged *a) {
+  Usz curs_y, curs_x, curs_h, curs_w;
+  if (!ged_try_selection_clipped_to_field(a, &curs_y, &curs_x, &curs_h,
+                                          &curs_w) ||
+      curs_h == 0 || curs_w == 0 || curs_x == 0 ||
+      curs_x + curs_w >= a->field.width)
+    return false;
+
+  bool all_commented = true;
+  bool all_empty = true;
+  for (Usz y = curs_y; y < curs_y + curs_h; ++y) {
+    Glyph const *row = a->field.buffer + y * a->field.width;
+    Glyph left = row[curs_x - 1];
+    Glyph right = row[curs_x + curs_w];
+    if (left != '#' || right != '#')
+      all_commented = false;
+    if (left != '.' || right != '.')
+      all_empty = false;
+  }
+  if (!all_commented && !all_empty)
+    return false;
+
+  undo_history_push(&a->undo_hist, &a->field, a->tick_num);
+  for (Usz y = curs_y; y < curs_y + curs_h; ++y) {
+    Glyph *row = a->field.buffer + y * a->field.width;
+    Glyph marker = all_commented ? '.' : '#';
+    row[curs_x - 1] = marker;
+    row[curs_x + curs_w] = marker;
+  }
+  a->needs_remarking = true;
+  a->is_draw_dirty = true;
+  return true;
+}
+
 staticni bool ged_copy_selection_to_clipbard(Ged *a) {
   Usz curs_y, curs_x, curs_h, curs_w;
   if (!ged_try_selection_clipped_to_field(a, &curs_y, &curs_x, &curs_h,
@@ -2034,6 +2068,7 @@ typedef enum {
   Ged_input_cmd_cut,
   Ged_input_cmd_copy,
   Ged_input_cmd_paste,
+  Ged_input_cmd_comment,
   Ged_input_cmd_escape,
 } Ged_input_cmd;
 
@@ -2123,6 +2158,9 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     break;
   case Ged_input_cmd_copy:
     ged_copy_selection_to_clipbard(a);
+    break;
+  case Ged_input_cmd_comment:
+    ged_comment_selection(a);
     break;
   case Ged_input_cmd_paste: {
     Usz field_h = a->field.height;
@@ -2650,6 +2688,7 @@ static void push_controls_msg(void) {
       {"Ctrl+X", "Cut"},
       {"Ctrl+C", "Copy"},
       {"Ctrl+V", "Paste"},
+      {"Ctrl+/", "Toggle comment on selection"},
       {"Ctrl+S", "Save"},
       {"Ctrl+F", "Frame Step Forward"},
       {"Ctrl+R", "Reset Frame Number"},
@@ -4561,6 +4600,9 @@ event_loop:;
   case CTRL_PLUS('z'):
   case CTRL_PLUS('u'):
     ged_input_cmd(&t.ged, Ged_input_cmd_undo);
+    break;
+  case CTRL_PLUS('_'): // Ctrl+/ is commonly sent as ASCII Unit Separator.
+    ged_input_cmd(&t.ged, Ged_input_cmd_comment);
     break;
   case CTRL_PLUS('r'):
     t.ged.tick_num = 0;
