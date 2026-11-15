@@ -175,6 +175,7 @@ Choose `Import as module...` to select a grid and preview it at the current curs
 │           Ctrl+X  Cut                               │
 │           Ctrl+C  Copy                              │
 │           Ctrl+V  Paste                             │
+│          Ctrl+/  Toggle comment on selection        │
 │           Ctrl+S  Save                              │
 │           Ctrl+F  Frame Step Forward                │
 │           Ctrl+R  Reset Frame Number                │
